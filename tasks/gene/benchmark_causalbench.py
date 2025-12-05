@@ -27,6 +27,7 @@ import wandb
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
 from models.ctm_gene import ContinuousThoughtMachineGENE
+from models.ctm_gene_attention import ContinuousThoughtMachineGENEAttention
 from tasks.gene.benchmark_utils import reconstruct_synch_matrix
 
 # CausalBench imports
@@ -67,6 +68,12 @@ def parse_args():
                         help='Max path length for evaluation (-1 for unlimited)')
     parser.add_argument('--subset_data', type=float, default=1.0,
                         help='Fraction of data to use')
+    parser.add_argument('--use_attention', action='store_true',
+                        help='Use attention-based synapse (directional GRN)')
+    parser.add_argument('--n_attention_heads', type=int, default=4,
+                        help='Number of attention heads (when using attention)')
+    parser.add_argument('--d_attention_head', type=int, default=64,
+                        help='Dimension per attention head')
     return parser.parse_args()
 
 
@@ -153,33 +160,61 @@ class CTMPerturbationModel(nn.Module):
     CTM wrapper for perturbation prediction.
     
     Takes control expression + knockout mask → predicts post-knockout expression
+    
+    Two variants:
+    1. Synchronization-based (default): Uses U-Net synapse, extracts GRN from sync matrix
+    2. Attention-based: Uses attention synapse, extracts DIRECTIONAL GRN from attention weights
     """
     
-    def __init__(self, n_genes, n_ticks=30, device='cpu'):
+    def __init__(self, n_genes, n_ticks=30, device='cpu', 
+                 use_attention=False, n_attention_heads=4, d_attention_head=64):
         super().__init__()
         self.n_genes = n_genes
         self.n_ticks = n_ticks
         self.device = device
+        self.use_attention = use_attention
         
-        # Build CTM
-        self.ctm = ContinuousThoughtMachineGENE(
-            iterations=n_ticks,
-            d_model=n_genes,
-            d_input=n_genes,
-            heads=0,
-            n_synch_out=n_genes,
-            n_synch_action=0,
-            synapse_depth=2,
-            memory_length=10,
-            deep_nlms=True,
-            memory_hidden_dims=4,
-            do_layernorm_nlm=False,
-            backbone_type='none',
-            positional_embedding_type='none',
-            out_dims=n_genes,
-            neuron_select_type='first-last',
-            dropout=0.0
-        ).to(device)
+        if use_attention:
+            print(f"Using ATTENTION-based synapse (directional GRN)")
+            print(f"  Heads: {n_attention_heads}, Head dim: {d_attention_head}")
+            # Build Attention-based CTM
+            self.ctm = ContinuousThoughtMachineGENEAttention(
+                iterations=n_ticks,
+                d_model=n_genes,
+                d_input=n_genes,
+                n_synch_out=n_genes,
+                synapse_depth=2,
+                memory_length=10,
+                deep_nlms=True,
+                memory_hidden_dims=4,
+                do_layernorm_nlm=False,
+                out_dims=n_genes,
+                neuron_select_type='first-last',
+                dropout=0.0,
+                n_attention_heads=n_attention_heads,
+                d_attention_head=d_attention_head,
+            ).to(device)
+        else:
+            print("Using standard synapse (symmetric GRN from sync matrix)")
+            # Build standard CTM
+            self.ctm = ContinuousThoughtMachineGENE(
+                iterations=n_ticks,
+                d_model=n_genes,
+                d_input=n_genes,
+                heads=0,
+                n_synch_out=n_genes,
+                n_synch_action=0,
+                synapse_depth=2,
+                memory_length=10,
+                deep_nlms=True,
+                memory_hidden_dims=4,
+                do_layernorm_nlm=False,
+                backbone_type='none',
+                positional_embedding_type='none',
+                out_dims=n_genes,
+                neuron_select_type='first-last',
+                dropout=0.0
+            ).to(device)
         
         # Initialize lazy modules
         dummy = torch.randn(1, n_genes, device=device)
@@ -193,17 +228,29 @@ class CTMPerturbationModel(nn.Module):
             
         Returns:
             final_pred: (B, N_genes) predicted expression after perturbation
-            synch: synchronization matrix (if track=True)
+            synch_or_attn: synchronization matrix or attention weights
         """
         if track:
-            predictions, certainties, synch_tracking, pre_act, post_act = self.ctm(x, track=True)
-            # Return final prediction and final synchronization
-            final_pred = predictions[:, :, -1]
-            return final_pred, synch_tracking[-1]
+            if self.use_attention:
+                # Attention model returns attention tracking
+                predictions, certainties, synch_tracking, pre_act, post_act, attn_tracking = self.ctm(x, track=True)
+                final_pred = predictions[:, :, -1]
+                # Return final attention weights (averaged over ticks)
+                return final_pred, attn_tracking
+            else:
+                predictions, certainties, synch_tracking, pre_act, post_act = self.ctm(x, track=True)
+                final_pred = predictions[:, :, -1]
+                return final_pred, synch_tracking[-1]
         else:
             predictions, certainties, synch = self.ctm(x, track=False)
             final_pred = predictions[:, :, -1]
             return final_pred, synch
+    
+    def get_attention_grn(self, aggregate='mean'):
+        """Get GRN from attention weights (only for attention model)."""
+        if not self.use_attention:
+            raise ValueError("Attention GRN only available with use_attention=True")
+        return self.ctm.get_attention_grn(aggregate=aggregate)
 
 
 def train_perturbation_model(model, dataset, device='cpu', training_iterations=2000, 
@@ -257,43 +304,86 @@ def train_perturbation_model(model, dataset, device='cpu', training_iterations=2
 
 def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
     """
-    Extract top-k edges from trained CTM synchronization matrix.
+    Extract top-k edges from trained CTM.
+    
+    For sync-based model: extracts from synchronization matrix (symmetric)
+    For attention-based model: extracts from attention weights (DIRECTIONAL)
     """
     model.eval()
     gene_names = dataset.gene_names
     n_genes = len(gene_names)
     
-    # Run model on control expression to get synchronization
     with torch.no_grad():
         x = dataset.control_expr.unsqueeze(0).to(device)
-        _, synch = model(x, track=True)
+        _, result = model(x, track=True)
         
-        # synch is (B, synch_dim) - reconstruct full matrix
-        synch_vec = synch[0]  # First batch element
-        if isinstance(synch_vec, np.ndarray):
-            synch_vec = synch_vec
+        if model.use_attention:
+            # Attention-based: result is attention tracking array
+            # Shape: (T, B, n_heads, n_genes, n_genes)
+            attn_history = result
+            
+            # Average over time, batch, and heads to get (n_genes, n_genes) matrix
+            grn_matrix = attn_history.mean(axis=(0, 1, 2))
+            
+            # Attention is DIRECTIONAL: A[i,j] = "gene i regulates gene j"
+            # Extract ALL edges (not just upper triangle)
+            np.fill_diagonal(grn_matrix, 0)
+            
+            # Get indices of all non-diagonal elements
+            rows, cols = np.where(np.ones((n_genes, n_genes)) - np.eye(n_genes))
+            weights = grn_matrix[rows, cols]
+            
+            # For attention, higher weight = stronger regulatory influence
+            sorted_idx = np.argsort(weights)[::-1]
+            top_k = min(top_k, len(sorted_idx))
+            
+            edges = []
+            seen_edges = set()
+            for i in range(len(sorted_idx)):
+                if len(edges) >= top_k:
+                    break
+                idx = sorted_idx[i]
+                gene_a_idx = int(rows[idx])
+                gene_b_idx = int(cols[idx])
+                gene_a = gene_names[gene_a_idx]
+                gene_b = gene_names[gene_b_idx]
+                # Skip duplicates (since attention is directional, A->B and B->A are different)
+                edge_key = (gene_a, gene_b)
+                if edge_key not in seen_edges and gene_a != gene_b:
+                    edges.append((gene_a, gene_b))
+                    seen_edges.add(edge_key)
+            
+            print(f"Extracted {len(edges)} DIRECTIONAL edges from attention weights")
+            print(f"  (A->B means gene A regulates gene B)")
+            return edges, grn_matrix
+        
         else:
-            synch_vec = synch_vec.cpu().numpy()
-        
-        synch_matrix = reconstruct_synch_matrix(synch_vec, n_genes)
-    
-    # Get top-k edges by absolute weight (excluding diagonal)
-    np.fill_diagonal(synch_matrix, 0)
-    triu_idx = np.triu_indices(n_genes, k=1)
-    weights = synch_matrix[triu_idx]
-    abs_weights = np.abs(weights)
-    
-    sorted_idx = np.argsort(abs_weights)[::-1]
-    top_k = min(top_k, len(sorted_idx))
-    
-    edges = []
-    for i in range(top_k):
-        idx = sorted_idx[i]
-        gene_a = gene_names[triu_idx[0][idx]]
-        gene_b = gene_names[triu_idx[1][idx]]
-        edges.append((gene_a, gene_b))
-    
-    return edges, synch_matrix
+            # Sync-based: result is synchronization vector
+            synch_vec = result[0]  # First batch element
+            if isinstance(synch_vec, np.ndarray):
+                synch_vec = synch_vec
+            else:
+                synch_vec = synch_vec.cpu().numpy()
+            
+            synch_matrix = reconstruct_synch_matrix(synch_vec, n_genes)
+            
+            # Sync matrix is symmetric - only need upper triangle
+            np.fill_diagonal(synch_matrix, 0)
+            triu_idx = np.triu_indices(n_genes, k=1)
+            weights = synch_matrix[triu_idx]
+            abs_weights = np.abs(weights)
+            
+            sorted_idx = np.argsort(abs_weights)[::-1]
+            top_k = min(top_k, len(sorted_idx))
+            
+            edges = []
+            for i in range(top_k):
+                idx = sorted_idx[i]
+                gene_a = gene_names[triu_idx[0][idx]]
+                gene_b = gene_names[triu_idx[1][idx]]
+                edges.append((gene_a, gene_b))
+            
+            return edges, synch_matrix
 
 
 def run_causalbench_evaluation(args):
@@ -369,9 +459,10 @@ def run_causalbench_evaluation(args):
         return None
     
     # Initialize wandb
+    synapse_type = "attention" if args.use_attention else "synch"
     wandb.init(
         project="ctm-gene-causalbench",
-        name=f"{args.dataset}_perturbation",
+        name=f"{args.dataset}_{synapse_type}",
         config=vars(args)
     )
     
@@ -380,7 +471,10 @@ def run_causalbench_evaluation(args):
     model = CTMPerturbationModel(
         n_genes=len(gene_names),
         n_ticks=args.n_ticks,
-        device=args.device
+        device=args.device,
+        use_attention=args.use_attention,
+        n_attention_heads=args.n_attention_heads,
+        d_attention_head=args.d_attention_head,
     ).to(args.device)
     
     print(f"\nTraining for {args.training_iterations} iterations...")
@@ -402,18 +496,25 @@ def run_causalbench_evaluation(args):
     plt.close()
     
     # Extract edges
-    print("\nExtracting edges from synchronization matrix...")
-    edges, synch_matrix = extract_edges_from_model(
+    if args.use_attention:
+        print("\nExtracting edges from attention weights (DIRECTIONAL)...")
+    else:
+        print("\nExtracting edges from synchronization matrix...")
+    edges, grn_matrix = extract_edges_from_model(
         model, train_dataset, args.device, args.top_k_edges
     )
     print(f"Extracted {len(edges)} edges")
     
-    # Plot synchronization matrix
+    # Plot GRN matrix
     plt.figure(figsize=(10, 8))
-    plt.imshow(np.abs(synch_matrix), cmap='viridis', aspect='auto')
-    plt.colorbar(label='|Synchronization|')
-    plt.title('Inferred GRN (Synchronization Matrix)')
-    plt.savefig(os.path.join(args.output_dir, 'synch_matrix.png'), dpi=150)
+    plt.imshow(np.abs(grn_matrix), cmap='viridis', aspect='auto')
+    if args.use_attention:
+        plt.colorbar(label='|Attention Weight|')
+        plt.title('Inferred GRN (Attention Weights - DIRECTIONAL)')
+    else:
+        plt.colorbar(label='|Synchronization|')
+        plt.title('Inferred GRN (Synchronization Matrix)')
+    plt.savefig(os.path.join(args.output_dir, 'grn_matrix.png'), dpi=150)
     plt.close()
     
     # Evaluate with CausalBench

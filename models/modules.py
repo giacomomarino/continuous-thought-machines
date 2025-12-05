@@ -143,6 +143,147 @@ class SynapseUNET(nn.Module):
         return outs_up
 
 
+class AttentionSynapse(nn.Module):
+    """
+    Attention-based Synapse Model for Gene Regulatory Networks.
+    
+    This module uses self-attention to model gene-to-gene regulatory interactions.
+    Each gene "queries" all other genes to determine how to update its state.
+    
+    Key Property: The attention weights matrix A is ASYMMETRIC:
+        - A[i,j] = "To update gene j, attend to gene i's value"
+        - A[i,j] != A[j,i] in general
+    
+    This captures DIRECTIONAL regulatory relationships:
+        - High A[TF, target] means the transcription factor regulates the target
+        - The reverse may be zero
+    
+    The attention weights can be directly interpreted as a Gene Regulatory Network!
+    
+    Args:
+        d_model (int): Number of genes
+        n_heads (int): Number of attention heads (default: 4)
+        dropout (float): Dropout rate for attention weights
+        d_head (int): Dimension per attention head for gene embeddings (default: 16)
+    """
+    def __init__(self, d_model, n_heads=4, dropout=0.0, d_head=16):
+        super().__init__()
+        self.d_model = d_model  # Number of genes
+        self.n_heads = n_heads
+        self.d_head = d_head
+        
+        # Project concatenated input [gene_expr, state] to gene-wise embeddings
+        # Input: (B, 2*d_model) -> Output: (B, d_model, d_head)
+        self.input_proj = nn.LazyLinear(d_model * d_head)
+        
+        # Per-gene Q, K, V projections
+        # These operate on individual gene embeddings
+        self.q_proj = nn.Linear(d_head, n_heads * d_head)
+        self.k_proj = nn.Linear(d_head, n_heads * d_head)
+        self.v_proj = nn.Linear(d_head, n_heads * d_head)
+        
+        # Output projection: gene embeddings back to scalar per gene
+        self.out_proj = nn.Linear(n_heads * d_head, 1)
+        
+        # Layer normalizations
+        self.ln1 = nn.LayerNorm(d_head)
+        self.ln2 = nn.LayerNorm(d_model)
+        
+        # Feed-forward network after attention
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+        self.scale = math.sqrt(d_head)
+        
+        # Store attention weights for GRN extraction
+        self.last_attention_weights = None
+        
+    def forward(self, x, return_attention=False):
+        """
+        Forward pass with gene-to-gene attention.
+        
+        Args:
+            x: Input tensor of shape (B, d_input) - concatenation of gene expression and state
+            return_attention: Whether to return attention weights
+            
+        Returns:
+            out: Updated state of shape (B, d_model)
+            attn_weights: (optional) Attention weights of shape (B, n_heads, n_genes, n_genes)
+        """
+        B = x.size(0)
+        N = self.d_model  # Number of genes
+        
+        # Project input to gene embeddings: (B, 2*N) -> (B, N, d_head)
+        x_proj = self.input_proj(x)
+        x_genes = x_proj.view(B, N, self.d_head)  # (B, N, d_head)
+        
+        # Store residual (sum of gene embeddings)
+        residual = x_genes.mean(dim=-1)  # (B, N) - scalar per gene
+        
+        # Layer norm on gene embeddings
+        x_norm = self.ln1(x_genes)  # (B, N, d_head)
+        
+        # Project to Q, K, V for each gene
+        # Q, K, V: (B, N, n_heads * d_head)
+        Q = self.q_proj(x_norm)
+        K = self.k_proj(x_norm)
+        V = self.v_proj(x_norm)
+        
+        # Reshape for multi-head attention: (B, N, n_heads, d_head) -> (B, n_heads, N, d_head)
+        Q = Q.view(B, N, self.n_heads, self.d_head).transpose(1, 2)
+        K = K.view(B, N, self.n_heads, self.d_head).transpose(1, 2)
+        V = V.view(B, N, self.n_heads, self.d_head).transpose(1, 2)
+        
+        # Compute gene-to-gene attention: (B, n_heads, N, N)
+        # A[b, h, i, j] = attention from gene i to gene j (gene i influences gene j)
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        attn_weights = F.softmax(attn_scores, dim=-2)  # Normalize over source genes (dim=-2)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Store for GRN extraction: (B, n_heads, N, N)
+        self.last_attention_weights = attn_weights.detach()
+        
+        # Apply attention: (B, n_heads, N, d_head)
+        attn_out = torch.matmul(attn_weights.transpose(-2, -1), V)  # Weighted sum of values
+        
+        # Reshape: (B, n_heads, N, d_head) -> (B, N, n_heads * d_head)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, N, self.n_heads * self.d_head)
+        
+        # Project to scalar per gene: (B, N, 1) -> (B, N)
+        attn_out = self.out_proj(attn_out).squeeze(-1)
+        
+        # Residual connection
+        x_out = residual + self.dropout(attn_out)
+        
+        # FFN with residual
+        x_out = x_out + self.ffn(self.ln2(x_out))
+        
+        if return_attention:
+            return x_out, attn_weights
+        return x_out
+    
+    def get_attention_grn(self):
+        """
+        Extract the Gene Regulatory Network from attention weights.
+        
+        Returns:
+            grn: Asymmetric GRN matrix of shape (n_genes, n_genes)
+                 grn[i,j] = regulatory influence of gene i on gene j
+        """
+        if self.last_attention_weights is None:
+            return None
+        
+        # Average over batch and heads: (N, N)
+        grn = self.last_attention_weights.mean(dim=(0, 1)).cpu().numpy()
+        return grn
+
+
 class SuperLinear(nn.Module):
     """
     SuperLinear Layer: Implements Neuron-Level Models (NLMs) for the CTM.
