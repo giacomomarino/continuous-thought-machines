@@ -15,3 +15,8 @@ datasets
 autoclip
 huggingface_hub
 safetensors
+anndata
+scanpy
+gseapy
+cellxgene-census
+causalbench

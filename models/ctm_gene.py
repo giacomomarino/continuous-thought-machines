@@ -122,12 +122,38 @@ class ContinuousThoughtMachineGENE(ContinuousThoughtMachine):
             return predictions, certainties, np.array(synch_out_tracking), np.array(pre_activations_tracking), np.array(post_activations_tracking)
         return predictions, certainties, synchronisation_out
 
-    def get_gene_regulation_graph(self, step_index=-1):
+    def get_gene_regulation_graph(self, activated_state, decay_alpha_out=None, decay_beta_out=None):
         """
-        Returns the synchronization matrix for a specific step, which serves as 
-        the inferred Gene Regulatory Network.
+        Returns the synchronization matrix for a specific state.
+        This requires the activated state and optionally the decay states if running sequentially.
+        If decay states are None, it computes instantaneous synchronization.
         """
-        # Note: This requires running with track=True to get the history.
-        # Or we can implement a method to compute full pairwise sync if needed.
-        pass
+        r_out = torch.exp(-torch.clamp(self.decay_params_out, 0, 15)).unsqueeze(0).repeat(activated_state.size(0), 1)
+        
+        # Use existing compute_synchronisation method which handles the 'first-last' logic
+        # to get the flattened upper triangle
+        synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(
+            activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out'
+        )
+        
+        return synchronisation_out, decay_alpha_out, decay_beta_out
+
+    def forward_with_knockout(self, x, knockout_indices, track=False):
+        """
+        Run forward pass with specific genes knocked out (zeroed).
+        
+        Args:
+            x: Input gene expression (B, N_genes)
+            knockout_indices: Index or list of indices of genes to knock out
+            track: Whether to track internal states
+        
+        Returns:
+            Same as forward() but with knocked out genes
+        """
+        x_perturbed = x.clone()
+        if isinstance(knockout_indices, int):
+            knockout_indices = [knockout_indices]
+        for idx in knockout_indices:
+            x_perturbed[:, idx] = 0.0
+        return self.forward(x_perturbed, track=track)
 
