@@ -22,6 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 import json
 from typing import List, Tuple
 from tqdm import tqdm
+import wandb
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
@@ -249,6 +250,7 @@ def train_perturbation_model(model, dataset, device='cpu', training_iterations=2
         
         losses.append(loss.item())
         pbar.set_description(f'Loss: {loss.item():.4f}')
+        wandb.log({"loss": loss.item(), "step": step})
     
     return losses
 
@@ -365,6 +367,13 @@ def run_causalbench_evaluation(args):
     if len(train_dataset) == 0:
         print("Error: No valid perturbations found in training data")
         return None
+    
+    # Initialize wandb
+    wandb.init(
+        project="ctm-gene-causalbench",
+        name=f"{args.dataset}_perturbation",
+        config=vars(args)
+    )
     
     # Create and train model
     print(f"\nBuilding CTM: {len(gene_names)} genes, {args.n_ticks} ticks")
@@ -483,6 +492,19 @@ def run_causalbench_evaluation(args):
     }, os.path.join(args.output_dir, 'model.pt'))
     
     print(f"\nResults saved to {args.output_dir}")
+    
+    # Log final metrics to wandb
+    wandb.log({
+        "true_positives": results['output_graph']['true_positives'],
+        "false_positives": results['output_graph']['false_positives'],
+        "precision": tp/(tp+fp),
+        "wasserstein_mean": results['output_graph']['wasserstein_distance']['mean'],
+        "wasserstein_ratio": wasserstein_ratio,
+        "false_omission_rate": results['false_omission_rate'],
+        "negative_mean_wasserstein": results['negative_mean_wasserstein'],
+        "final_loss": losses[-1] if losses else None,
+    })
+    wandb.finish()
     
     return results
 
