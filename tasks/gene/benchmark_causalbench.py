@@ -283,22 +283,21 @@ def run_causalbench_evaluation(args):
     print("This may download ~10GB of data on first run...")
     
     try:
-        dataset_creator = CreateDataset(args.data_dir)
+        # CreateDataset requires data_directory and filter arguments
+        dataset_creator = CreateDataset(args.data_dir, filter=True)
         
+        # Load both datasets (downloads if needed)
+        path_k562, path_rpe1 = dataset_creator.load()
+        
+        # Load the appropriate dataset
         if args.dataset == 'weissmann_k562':
-            data = dataset_creator.load_weissmann(
-                'k562',
-                subset_data=args.subset_data
-            )
+            data_path = path_k562
         else:
-            data = dataset_creator.load_weissmann(
-                'rpe1', 
-                subset_data=args.subset_data
-            )
+            data_path = path_rpe1
         
-        expression_matrix = data['expression_matrix']
-        interventions = data['interventions']
-        gene_names = data['gene_names']
+        # Use DatasetSplitter which handles train/test split
+        splitter = DatasetSplitter(data_path, subset_data=args.subset_data)
+        gene_names = splitter.gene_names
         
     except Exception as e:
         print(f"Error loading data: {e}")
@@ -306,14 +305,19 @@ def run_causalbench_evaluation(args):
         print(f"  causalbench_run --dataset_name {args.dataset} --data_directory {args.data_dir} ...")
         return None
     
-    print(f"Loaded: {expression_matrix.shape[0]} samples, {expression_matrix.shape[1]} genes")
+    # Get training and test data based on regime
+    if args.training_regime == 'observational':
+        train_expr, train_interventions, _ = splitter.get_observational()
+    elif args.training_regime == 'partial_interventional':
+        train_expr, train_interventions, _ = splitter.get_partial_interventional(fraction=0.5)
+    else:  # full interventional
+        train_expr, train_interventions, _ = splitter.get_interventional()
     
-    # Split data for training and evaluation
-    splitter = DatasetSplitter(expression_matrix, interventions, gene_names)
-    train_data, eval_data = splitter.split_data(
-        train_fraction=0.8,
-        seed=42
-    )
+    train_interventions = list(train_interventions)  # Convert from iterator
+    test_expr, test_interventions, _ = splitter.get_test_data()
+    
+    print(f"Training: {train_expr.shape[0]} samples, {train_expr.shape[1]} genes")
+    print(f"Test: {test_expr.shape[0]} samples")
     
     # Map training regime
     regime_map = {
@@ -336,8 +340,8 @@ def run_causalbench_evaluation(args):
     # Run inference
     print("\nRunning CTM inference...")
     edges = ctm_model(
-        expression_matrix=train_data['expression_matrix'],
-        interventions=train_data['interventions'],
+        expression_matrix=train_expr,
+        interventions=train_interventions,
         gene_names=gene_names,
         training_regime=training_regime,
         seed=42
@@ -346,8 +350,8 @@ def run_causalbench_evaluation(args):
     # Evaluate using CausalBench's evaluator
     print("\nEvaluating network...")
     evaluator = Evaluator(
-        expression_matrix=eval_data['expression_matrix'],
-        interventions=eval_data['interventions'],
+        expression_matrix=test_expr,
+        interventions=test_interventions,
         gene_names=gene_names,
     )
     
