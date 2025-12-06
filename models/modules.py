@@ -244,6 +244,9 @@ class AttentionSynapse(nn.Module):
         # A[b, h, i, j] = attention from gene i to gene j (gene i influences gene j)
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
         
+        # Clamp scores to prevent extreme sigmoid saturation
+        attn_scores = torch.clamp(attn_scores, min=-10, max=10)
+        
         # Use SIGMOID instead of softmax for sparse, independent regulatory weights
         # Softmax forces sum=1 (uniform ~1/N), sigmoid allows sparse patterns (0-1 per edge)
         attn_weights = torch.sigmoid(attn_scores)
