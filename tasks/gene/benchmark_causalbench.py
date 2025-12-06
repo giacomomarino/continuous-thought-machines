@@ -98,15 +98,23 @@ def visualize_enhanced_heatmap(grn_matrix, output_dir, title_suffix=""):
 
 def visualize_per_head_attention(attn_history, output_dir, n_heads=4):
     """
-    Visualize each attention head separately in a 2x2 grid.
+    Visualize each attention head separately in a dynamic grid.
     attn_history: (T, B, n_heads, n_genes, n_genes)
     """
     # Average over time and batch
     attn_avg = attn_history.mean(axis=(0, 1))  # (n_heads, n_genes, n_genes)
     
     n_heads_actual = min(n_heads, attn_avg.shape[0])
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    axes = axes.flatten()
+    
+    # Create dynamic grid size based on number of heads
+    n_cols = min(4, n_heads_actual)
+    n_rows = (n_heads_actual + n_cols - 1) // n_cols  # Ceiling division
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 4*n_rows))
+    if n_heads_actual == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten() if hasattr(axes, 'flatten') else [axes]
     
     for h in range(n_heads_actual):
         ax = axes[h]
@@ -129,7 +137,7 @@ def visualize_per_head_attention(attn_history, output_dir, n_heads=4):
         ax.set_ylabel('Source Gene')
     
     # Hide unused axes
-    for h in range(n_heads_actual, 4):
+    for h in range(n_heads_actual, len(axes)):
         axes[h].axis('off')
     
     plt.suptitle('Per-Head Attention Weights', fontsize=14)
