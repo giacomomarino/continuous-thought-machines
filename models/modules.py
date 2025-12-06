@@ -243,7 +243,10 @@ class AttentionSynapse(nn.Module):
         # Compute gene-to-gene attention: (B, n_heads, N, N)
         # A[b, h, i, j] = attention from gene i to gene j (gene i influences gene j)
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        attn_weights = F.softmax(attn_scores, dim=-2)  # Normalize over source genes (dim=-2)
+        
+        # Use SIGMOID instead of softmax for sparse, independent regulatory weights
+        # Softmax forces sum=1 (uniform ~1/N), sigmoid allows sparse patterns (0-1 per edge)
+        attn_weights = torch.sigmoid(attn_scores)
         attn_weights = self.dropout(attn_weights)
         
         # Store for GRN extraction: (B, n_heads, N, N)
