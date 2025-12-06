@@ -70,9 +70,11 @@ def parse_args():
                         help='Fraction of data to use')
     parser.add_argument('--use_attention', action='store_true',
                         help='Use attention-based synapse (directional GRN)')
+    parser.add_argument('--use_combined', action='store_true',
+                        help='Use COMBINED: attention direction × sync magnitude')
     parser.add_argument('--n_attention_heads', type=int, default=4,
                         help='Number of attention heads (when using attention)')
-    parser.add_argument('--d_attention_head', type=int, default=64,
+    parser.add_argument('--d_attention_head', type=int, default=16,
                         help='Dimension per attention head')
     return parser.parse_args()
 
@@ -161,21 +163,25 @@ class CTMPerturbationModel(nn.Module):
     
     Takes control expression + knockout mask → predicts post-knockout expression
     
-    Two variants:
+    Three variants:
     1. Synchronization-based (default): Uses U-Net synapse, extracts GRN from sync matrix
     2. Attention-based: Uses attention synapse, extracts DIRECTIONAL GRN from attention weights
+    3. Combined: Uses attention synapse, combines attention direction × sync magnitude
     """
     
     def __init__(self, n_genes, n_ticks=30, device='cpu', 
-                 use_attention=False, n_attention_heads=4, d_attention_head=64):
+                 use_attention=False, use_combined=False,
+                 n_attention_heads=4, d_attention_head=16):
         super().__init__()
         self.n_genes = n_genes
         self.n_ticks = n_ticks
         self.device = device
-        self.use_attention = use_attention
+        self.use_attention = use_attention or use_combined  # Combined requires attention
+        self.use_combined = use_combined
         
-        if use_attention:
-            print(f"Using ATTENTION-based synapse (directional GRN)")
+        if self.use_attention:
+            mode = "COMBINED (attention direction × sync magnitude)" if use_combined else "ATTENTION-based (directional GRN)"
+            print(f"Using {mode}")
             print(f"  Heads: {n_attention_heads}, Head dim: {d_attention_head}")
             # Build Attention-based CTM
             self.ctm = ContinuousThoughtMachineGENEAttention(
@@ -228,19 +234,21 @@ class CTMPerturbationModel(nn.Module):
             
         Returns:
             final_pred: (B, N_genes) predicted expression after perturbation
-            synch_or_attn: synchronization matrix or attention weights
+            tracking_data: dict with 'synch' and optionally 'attention'
         """
         if track:
             if self.use_attention:
-                # Attention model returns attention tracking
+                # Attention model returns both sync and attention tracking
                 predictions, certainties, synch_tracking, pre_act, post_act, attn_tracking = self.ctm(x, track=True)
                 final_pred = predictions[:, :, -1]
-                # Return final attention weights (averaged over ticks)
-                return final_pred, attn_tracking
+                return final_pred, {
+                    'synch': synch_tracking,
+                    'attention': attn_tracking
+                }
             else:
                 predictions, certainties, synch_tracking, pre_act, post_act = self.ctm(x, track=True)
                 final_pred = predictions[:, :, -1]
-                return final_pred, synch_tracking[-1]
+                return final_pred, {'synch': synch_tracking[-1]}
         else:
             predictions, certainties, synch = self.ctm(x, track=False)
             final_pred = predictions[:, :, -1]
@@ -308,6 +316,7 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
     
     For sync-based model: extracts from synchronization matrix (symmetric)
     For attention-based model: extracts from attention weights (DIRECTIONAL)
+    For combined model: attention_direction × sync_magnitude (DIRECTIONAL + strong)
     """
     model.eval()
     gene_names = dataset.gene_names
@@ -317,23 +326,38 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
         x = dataset.control_expr.unsqueeze(0).to(device)
         _, result = model(x, track=True)
         
-        if model.use_attention:
-            # Attention-based: result is attention tracking array
-            # Shape: (T, B, n_heads, n_genes, n_genes)
-            attn_history = result
+        if model.use_combined:
+            # COMBINED: attention direction × sync magnitude
+            print("Combining attention (direction) × sync (magnitude)...")
             
-            # Average over time, batch, and heads to get (n_genes, n_genes) matrix
-            grn_matrix = attn_history.mean(axis=(0, 1, 2))
+            attn_history = result['attention']  # (T, B, n_heads, n_genes, n_genes)
+            synch_history = result['synch']     # (T, B, synch_dim)
             
-            # Attention is DIRECTIONAL: A[i,j] = "gene i regulates gene j"
-            # Extract ALL edges (not just upper triangle)
-            np.fill_diagonal(grn_matrix, 0)
+            # Get attention matrix (direction): average over time, batch, heads
+            attn_matrix = attn_history.mean(axis=(0, 1, 2))  # (n_genes, n_genes)
             
-            # Get indices of all non-diagonal elements
+            # Get sync matrix (magnitude): use final timestep
+            synch_vec = synch_history[-1, 0]  # Final time, first batch
+            synch_matrix = reconstruct_synch_matrix(synch_vec, n_genes)
+            
+            # COMBINE: attention provides direction, sync provides magnitude
+            # Attention is already normalized (softmax), sync has raw magnitude
+            # Strategy: Use attention to "mask" sync matrix directionally
+            
+            # Make sync matrix absolute (we'll use attention for sign/direction)
+            sync_magnitude = np.abs(synch_matrix)
+            
+            # Combined GRN: attention_weight * sync_magnitude
+            # This is DIRECTIONAL (from attention) with MAGNITUDE (from sync)
+            combined_grn = attn_matrix * sync_magnitude
+            
+            # Zero diagonal
+            np.fill_diagonal(combined_grn, 0)
+            
+            # Get indices of all non-diagonal elements (directional)
             rows, cols = np.where(np.ones((n_genes, n_genes)) - np.eye(n_genes))
-            weights = grn_matrix[rows, cols]
+            weights = combined_grn[rows, cols]
             
-            # For attention, higher weight = stronger regulatory influence
             sorted_idx = np.argsort(weights)[::-1]
             top_k = min(top_k, len(sorted_idx))
             
@@ -347,21 +371,55 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
                 gene_b_idx = int(cols[idx])
                 gene_a = gene_names[gene_a_idx]
                 gene_b = gene_names[gene_b_idx]
-                # Skip duplicates (since attention is directional, A->B and B->A are different)
                 edge_key = (gene_a, gene_b)
                 if edge_key not in seen_edges and gene_a != gene_b:
                     edges.append((gene_a, gene_b))
                     seen_edges.add(edge_key)
             
-            print(f"Extracted {len(edges)} DIRECTIONAL edges from attention weights")
-            print(f"  (A->B means gene A regulates gene B)")
+            print(f"Extracted {len(edges)} COMBINED edges (attention×sync)")
+            print(f"  Attention provides DIRECTION, Sync provides MAGNITUDE")
+            return edges, combined_grn
+        
+        elif model.use_attention:
+            # Attention-only: result is dict with 'attention' key
+            attn_history = result['attention']  # (T, B, n_heads, n_genes, n_genes)
+            
+            # Average over time, batch, and heads to get (n_genes, n_genes) matrix
+            grn_matrix = attn_history.mean(axis=(0, 1, 2))
+            
+            # Attention is DIRECTIONAL: A[i,j] = "gene i regulates gene j"
+            np.fill_diagonal(grn_matrix, 0)
+            
+            rows, cols = np.where(np.ones((n_genes, n_genes)) - np.eye(n_genes))
+            weights = grn_matrix[rows, cols]
+            
+            sorted_idx = np.argsort(weights)[::-1]
+            top_k = min(top_k, len(sorted_idx))
+            
+            edges = []
+            seen_edges = set()
+            for i in range(len(sorted_idx)):
+                if len(edges) >= top_k:
+                    break
+                idx = sorted_idx[i]
+                gene_a_idx = int(rows[idx])
+                gene_b_idx = int(cols[idx])
+                gene_a = gene_names[gene_a_idx]
+                gene_b = gene_names[gene_b_idx]
+                edge_key = (gene_a, gene_b)
+                if edge_key not in seen_edges and gene_a != gene_b:
+                    edges.append((gene_a, gene_b))
+                    seen_edges.add(edge_key)
+            
+            print(f"Extracted {len(edges)} DIRECTIONAL edges from attention")
             return edges, grn_matrix
         
         else:
-            # Sync-based: result is synchronization vector
-            synch_vec = result[0]  # First batch element
+            # Sync-based: result is dict with 'synch' key
+            synch_vec = result['synch']
             if isinstance(synch_vec, np.ndarray):
-                synch_vec = synch_vec
+                if synch_vec.ndim > 1:
+                    synch_vec = synch_vec[0]  # First batch element
             else:
                 synch_vec = synch_vec.cpu().numpy()
             
@@ -459,7 +517,12 @@ def run_causalbench_evaluation(args):
         return None
     
     # Initialize wandb
-    synapse_type = "attention" if args.use_attention else "synch"
+    if args.use_combined:
+        synapse_type = "combined"
+    elif args.use_attention:
+        synapse_type = "attention"
+    else:
+        synapse_type = "synch"
     wandb.init(
         project="ctm-gene-causalbench",
         name=f"{args.dataset}_{synapse_type}",
@@ -473,6 +536,7 @@ def run_causalbench_evaluation(args):
         n_ticks=args.n_ticks,
         device=args.device,
         use_attention=args.use_attention,
+        use_combined=args.use_combined,
         n_attention_heads=args.n_attention_heads,
         d_attention_head=args.d_attention_head,
     ).to(args.device)
@@ -496,7 +560,9 @@ def run_causalbench_evaluation(args):
     plt.close()
     
     # Extract edges
-    if args.use_attention:
+    if args.use_combined:
+        print("\nExtracting edges using COMBINED (attention×sync)...")
+    elif args.use_attention:
         print("\nExtracting edges from attention weights (DIRECTIONAL)...")
     else:
         print("\nExtracting edges from synchronization matrix...")
@@ -508,7 +574,10 @@ def run_causalbench_evaluation(args):
     # Plot GRN matrix
     plt.figure(figsize=(10, 8))
     plt.imshow(np.abs(grn_matrix), cmap='viridis', aspect='auto')
-    if args.use_attention:
+    if args.use_combined:
+        plt.colorbar(label='|Attention × Sync|')
+        plt.title('Inferred GRN (COMBINED: Direction × Magnitude)')
+    elif args.use_attention:
         plt.colorbar(label='|Attention Weight|')
         plt.title('Inferred GRN (Attention Weights - DIRECTIONAL)')
     else:
