@@ -201,6 +201,11 @@ class AttentionSynapse(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.scale = math.sqrt(d_head)
         
+        # Learnable temperature for sigmoid sharpening
+        # Higher temperature = sharper sigmoid (more binary 0/1 outputs)
+        # Initialize at 5.0 to encourage non-uniform attention
+        self.temperature = nn.Parameter(torch.tensor(5.0))
+        
         # Store attention weights for GRN extraction
         self.last_attention_weights = None
         
@@ -243,6 +248,12 @@ class AttentionSynapse(nn.Module):
         # Compute gene-to-gene attention: (B, n_heads, N, N)
         # A[b, h, i, j] = attention from gene i to gene j (gene i influences gene j)
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        
+        # Apply learnable temperature to sharpen sigmoid
+        # Higher temp = sharper transitions, forces network to commit to 0 or 1
+        # sigmoid(5 * 0.5) = 0.92, sigmoid(5 * -0.5) = 0.08 (much sharper than sigmoid(0.5) = 0.62)
+        temp = torch.clamp(self.temperature, min=1.0, max=20.0)  # Keep temp in reasonable range
+        attn_scores = attn_scores * temp
         
         # Clamp scores to prevent extreme sigmoid saturation
         attn_scores = torch.clamp(attn_scores, min=-10, max=10)
