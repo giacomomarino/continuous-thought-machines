@@ -30,10 +30,11 @@ from models.ctm_gene import ContinuousThoughtMachineGENE
 from models.ctm_gene_attention import ContinuousThoughtMachineGENEAttention
 from tasks.gene.benchmark_utils import reconstruct_synch_matrix
 import matplotlib.pyplot as plt
-from matplotlib.colors import SymLogNorm
+from matplotlib.colors import SymLogNorm, LogNorm
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import pdist
 import networkx as nx
+import seaborn as sns
 
 
 # =============================================================================
@@ -42,37 +43,47 @@ import networkx as nx
 
 def visualize_enhanced_heatmap(grn_matrix, output_dir, title_suffix=""):
     """
-    Create enhanced GRN heatmap with log-scale and sparsification.
+    Create enhanced GRN heatmap with diverging colormap showing activation vs inhibition.
+    
+    Colors:
+    - Red = Inhibition (negative weights)
+    - White = No regulation
+    - Blue = Activation (positive weights)
     """
     n_genes = grn_matrix.shape[0]
     
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     
-    # 1. Log-scale visualization
-    ax = axes[0]
-    # Use SymLogNorm for log scale that handles zero/negative values
+    # Compute symmetric limits for diverging colormap
     vmax = np.abs(grn_matrix).max()
-    vmin = np.abs(grn_matrix[grn_matrix != 0]).min() if (grn_matrix != 0).any() else 1e-6
-    norm = SymLogNorm(linthresh=vmin, linscale=1, vmin=0, vmax=vmax)
-    im = ax.imshow(np.abs(grn_matrix), cmap='viridis', norm=norm, aspect='auto')
-    plt.colorbar(im, ax=ax, label='|Weight| (log scale)')
-    ax.set_title(f'Log-Scale GRN{title_suffix}')
+    vmin_nonzero = np.abs(grn_matrix[grn_matrix != 0]).min() if (grn_matrix != 0).any() else 1e-6
+    
+    # 1. Diverging log-scale visualization (preserves sign!)
+    ax = axes[0]
+    # SymLogNorm handles negative values with symmetric log scale
+    norm = SymLogNorm(linthresh=vmin_nonzero, linscale=1, vmin=-vmax, vmax=vmax)
+    im = ax.imshow(grn_matrix, cmap='RdBu_r', norm=norm, aspect='auto')
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Weight (log scale)\n← Inhibition | Activation →')
+    ax.set_title(f'Diverging Log-Scale GRN{title_suffix}')
     ax.set_xlabel('Target Gene')
     ax.set_ylabel('Source Gene')
     
-    # 2. Top-5% sparsified
+    # 2. Top-5% sparsified (preserves sign!)
     ax = axes[1]
     sparse_matrix = grn_matrix.copy()
     threshold = np.percentile(np.abs(sparse_matrix), 95)
     sparse_matrix[np.abs(sparse_matrix) < threshold] = 0
-    im = ax.imshow(np.abs(sparse_matrix), cmap='viridis', aspect='auto')
-    plt.colorbar(im, ax=ax, label='|Weight|')
+    sparse_vmax = np.abs(sparse_matrix).max() if np.abs(sparse_matrix).max() > 0 else 1
+    im = ax.imshow(sparse_matrix, cmap='RdBu_r', vmin=-sparse_vmax, vmax=sparse_vmax, aspect='auto')
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('← Inhibition | Activation →')
     n_nonzero = np.count_nonzero(sparse_matrix)
     ax.set_title(f'Top 5% Edges ({n_nonzero} edges){title_suffix}')
     ax.set_xlabel('Target Gene')
     ax.set_ylabel('Source Gene')
     
-    # 3. Hierarchically clustered
+    # 3. Hierarchically clustered (preserves sign!)
     ax = axes[2]
     try:
         # Cluster genes by their regulatory profiles
@@ -80,8 +91,10 @@ def visualize_enhanced_heatmap(grn_matrix, output_dir, title_suffix=""):
         linkage_matrix = linkage(dist_matrix, method='ward')
         order = leaves_list(linkage_matrix)
         clustered = grn_matrix[np.ix_(order, order)]
-        im = ax.imshow(np.abs(clustered), cmap='viridis', aspect='auto')
-        plt.colorbar(im, ax=ax, label='|Weight|')
+        clustered_vmax = np.abs(clustered).max()
+        im = ax.imshow(clustered, cmap='RdBu_r', vmin=-clustered_vmax, vmax=clustered_vmax, aspect='auto')
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('← Inhibition | Activation →')
         ax.set_title(f'Clustered GRN{title_suffix}')
     except Exception as e:
         ax.text(0.5, 0.5, f'Clustering failed:\n{str(e)[:50]}', 
@@ -94,6 +107,36 @@ def visualize_enhanced_heatmap(grn_matrix, output_dir, title_suffix=""):
     plt.savefig(os.path.join(output_dir, 'grn_matrix_enhanced.png'), dpi=150)
     plt.close()
     print(f"Saved enhanced heatmap to {output_dir}/grn_matrix_enhanced.png")
+    
+    # 4. Seaborn clustermap with dendrograms (diverging colormap!)
+    try:
+        plt.figure()
+        vmax_cluster = np.abs(grn_matrix).max()
+        
+        # Create clustermap with diverging colormap
+        g = sns.clustermap(
+            grn_matrix,
+            method='ward',
+            metric='euclidean',
+            cmap='RdBu_r',
+            center=0,  # Center colormap at zero
+            vmin=-vmax_cluster,
+            vmax=vmax_cluster,
+            figsize=(12, 10),
+            dendrogram_ratio=(0.15, 0.15),
+            cbar_pos=(0.02, 0.8, 0.03, 0.15),
+            xticklabels=False,
+            yticklabels=False,
+        )
+        g.ax_heatmap.set_xlabel('Target Gene')
+        g.ax_heatmap.set_ylabel('Source Gene')
+        g.fig.suptitle(f'Clustered GRN with Dendrograms{title_suffix}\n(Red=Inhibition, Blue=Activation)', y=1.02)
+        
+        plt.savefig(os.path.join(output_dir, 'grn_clustermap.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved clustermap to {output_dir}/grn_clustermap.png")
+    except Exception as e:
+        print(f"Clustermap failed: {e}")
 
 
 def visualize_per_head_attention(attn_history, output_dir, n_heads=4):
@@ -193,31 +236,43 @@ def visualize_temporal_attention(attn_history, output_dir):
 def visualize_grn_comparison(attn_matrix, sync_matrix, combined_matrix, output_dir):
     """
     Side-by-side comparison of attention, sync, and combined GRN matrices.
+    Uses diverging colormap to show activation (blue) vs inhibition (red).
     """
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     
     matrices = [
-        (attn_matrix, 'Attention (Direction)', 'plasma'),
-        (sync_matrix, 'Synchronization (Magnitude)', 'viridis'),
-        (combined_matrix, 'Combined (Attn × Sync)', 'inferno')
+        (attn_matrix, 'Attention (Direction)\n(Always positive - sigmoid)'),
+        (sync_matrix, 'Synchronization\n(Red=Inhibition, Blue=Activation)'),
+        (combined_matrix, 'Combined (Attn × Sync)\n(Red=Inhibition, Blue=Activation)')
     ]
     
-    for ax, (matrix, title, cmap) in zip(axes, matrices):
+    for ax, (matrix, title) in zip(axes, matrices):
         if matrix is None:
             ax.text(0.5, 0.5, 'Not available', ha='center', va='center', 
                     transform=ax.transAxes, fontsize=12)
             ax.set_title(title)
             continue
-            
-        matrix = np.abs(matrix)
+        
+        matrix = matrix.copy()
         np.fill_diagonal(matrix, 0)
         
-        vmax = matrix.max()
-        vmin = max(matrix[matrix != 0].min(), 1e-6) if (matrix != 0).any() else 1e-6
-        norm = SymLogNorm(linthresh=vmin, linscale=1, vmin=0, vmax=vmax)
+        vmax = np.abs(matrix).max()
+        vmin_nz = np.abs(matrix[matrix != 0]).min() if (matrix != 0).any() else 1e-6
         
-        im = ax.imshow(matrix, cmap=cmap, norm=norm, aspect='auto')
-        plt.colorbar(im, ax=ax, label='|Weight| (log)')
+        # Check if matrix has negative values (sync/combined) or not (attention)
+        has_negatives = (matrix < 0).any()
+        
+        if has_negatives:
+            # Diverging colormap for signed data
+            norm = SymLogNorm(linthresh=vmin_nz, linscale=1, vmin=-vmax, vmax=vmax)
+            im = ax.imshow(matrix, cmap='RdBu_r', norm=norm, aspect='auto')
+            plt.colorbar(im, ax=ax, label='← Inhibition | Activation →')
+        else:
+            # Sequential colormap for positive-only data (attention)
+            norm = SymLogNorm(linthresh=vmin_nz, linscale=1, vmin=0, vmax=vmax)
+            im = ax.imshow(matrix, cmap='viridis', norm=norm, aspect='auto')
+            plt.colorbar(im, ax=ax, label='Weight (log)')
+        
         ax.set_title(title)
         ax.set_xlabel('Target Gene')
         ax.set_ylabel('Source Gene')
