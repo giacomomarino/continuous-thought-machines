@@ -568,6 +568,10 @@ def train_perturbation_model(model, dataset, device='cpu', training_iterations=2
         loss = criterion(pred, target)
         
         loss.backward()
+        
+        # Gradient clipping to prevent explosion
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
         scheduler.step()
         
