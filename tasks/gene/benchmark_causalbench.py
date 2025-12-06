@@ -571,14 +571,14 @@ def train_perturbation_model(model, dataset, device='cpu', training_iterations=2
         
         # Aggressive gradient clipping to prevent explosion
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-        wandb.log({"loss": loss.item(), "grad_norm": grad_norm.item(), "step": step})
         
         optimizer.step()
         scheduler.step()
         
-        losses.append(loss.item())
-        pbar.set_description(f'Loss: {loss.item():.4f}')
-        wandb.log({"loss": loss.item(), "step": step})
+        loss_val = loss.item()
+        losses.append(loss_val)
+        pbar.set_description(f'Loss: {loss_val:.4f}')
+        wandb.log({"loss": loss_val, "grad_norm": grad_norm.item(), "step": step})
     
     return losses
 
