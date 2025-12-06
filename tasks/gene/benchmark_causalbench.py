@@ -29,6 +29,266 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 from models.ctm_gene import ContinuousThoughtMachineGENE
 from models.ctm_gene_attention import ContinuousThoughtMachineGENEAttention
 from tasks.gene.benchmark_utils import reconstruct_synch_matrix
+import matplotlib.pyplot as plt
+from matplotlib.colors import SymLogNorm
+from scipy.cluster.hierarchy import linkage, leaves_list
+from scipy.spatial.distance import pdist
+import networkx as nx
+
+
+# =============================================================================
+# VISUALIZATION FUNCTIONS
+# =============================================================================
+
+def visualize_enhanced_heatmap(grn_matrix, output_dir, title_suffix=""):
+    """
+    Create enhanced GRN heatmap with log-scale and sparsification.
+    """
+    n_genes = grn_matrix.shape[0]
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # 1. Log-scale visualization
+    ax = axes[0]
+    # Use SymLogNorm for log scale that handles zero/negative values
+    vmax = np.abs(grn_matrix).max()
+    vmin = np.abs(grn_matrix[grn_matrix != 0]).min() if (grn_matrix != 0).any() else 1e-6
+    norm = SymLogNorm(linthresh=vmin, linscale=1, vmin=0, vmax=vmax)
+    im = ax.imshow(np.abs(grn_matrix), cmap='viridis', norm=norm, aspect='auto')
+    plt.colorbar(im, ax=ax, label='|Weight| (log scale)')
+    ax.set_title(f'Log-Scale GRN{title_suffix}')
+    ax.set_xlabel('Target Gene')
+    ax.set_ylabel('Source Gene')
+    
+    # 2. Top-5% sparsified
+    ax = axes[1]
+    sparse_matrix = grn_matrix.copy()
+    threshold = np.percentile(np.abs(sparse_matrix), 95)
+    sparse_matrix[np.abs(sparse_matrix) < threshold] = 0
+    im = ax.imshow(np.abs(sparse_matrix), cmap='viridis', aspect='auto')
+    plt.colorbar(im, ax=ax, label='|Weight|')
+    n_nonzero = np.count_nonzero(sparse_matrix)
+    ax.set_title(f'Top 5% Edges ({n_nonzero} edges){title_suffix}')
+    ax.set_xlabel('Target Gene')
+    ax.set_ylabel('Source Gene')
+    
+    # 3. Hierarchically clustered
+    ax = axes[2]
+    try:
+        # Cluster genes by their regulatory profiles
+        dist_matrix = pdist(np.abs(grn_matrix) + np.abs(grn_matrix.T))
+        linkage_matrix = linkage(dist_matrix, method='ward')
+        order = leaves_list(linkage_matrix)
+        clustered = grn_matrix[np.ix_(order, order)]
+        im = ax.imshow(np.abs(clustered), cmap='viridis', aspect='auto')
+        plt.colorbar(im, ax=ax, label='|Weight|')
+        ax.set_title(f'Clustered GRN{title_suffix}')
+    except Exception as e:
+        ax.text(0.5, 0.5, f'Clustering failed:\n{str(e)[:50]}', 
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('Clustered (failed)')
+    ax.set_xlabel('Target Gene (reordered)')
+    ax.set_ylabel('Source Gene (reordered)')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'grn_matrix_enhanced.png'), dpi=150)
+    plt.close()
+    print(f"Saved enhanced heatmap to {output_dir}/grn_matrix_enhanced.png")
+
+
+def visualize_per_head_attention(attn_history, output_dir, n_heads=4):
+    """
+    Visualize each attention head separately in a 2x2 grid.
+    attn_history: (T, B, n_heads, n_genes, n_genes)
+    """
+    # Average over time and batch
+    attn_avg = attn_history.mean(axis=(0, 1))  # (n_heads, n_genes, n_genes)
+    
+    n_heads_actual = min(n_heads, attn_avg.shape[0])
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    axes = axes.flatten()
+    
+    for h in range(n_heads_actual):
+        ax = axes[h]
+        head_attn = attn_avg[h]
+        np.fill_diagonal(head_attn, 0)
+        
+        # Use log scale
+        vmax = np.abs(head_attn).max()
+        vmin = max(np.abs(head_attn[head_attn != 0]).min(), 1e-6) if (head_attn != 0).any() else 1e-6
+        norm = SymLogNorm(linthresh=vmin, linscale=1, vmin=0, vmax=vmax)
+        
+        im = ax.imshow(np.abs(head_attn), cmap='viridis', norm=norm, aspect='auto')
+        plt.colorbar(im, ax=ax, label='|Attention|')
+        
+        # Stats
+        top_5pct = np.percentile(np.abs(head_attn), 95)
+        entropy = -np.sum(head_attn * np.log(head_attn + 1e-10)) / head_attn.size
+        ax.set_title(f'Head {h+1}\nTop 5%: {top_5pct:.4f}, H: {entropy:.2f}')
+        ax.set_xlabel('Target Gene')
+        ax.set_ylabel('Source Gene')
+    
+    # Hide unused axes
+    for h in range(n_heads_actual, 4):
+        axes[h].axis('off')
+    
+    plt.suptitle('Per-Head Attention Weights', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'attention_per_head.png'), dpi=150)
+    plt.close()
+    print(f"Saved per-head attention to {output_dir}/attention_per_head.png")
+
+
+def visualize_temporal_attention(attn_history, output_dir):
+    """
+    Show how attention evolves over internal ticks.
+    attn_history: (T, B, n_heads, n_genes, n_genes)
+    """
+    T = attn_history.shape[0]
+    
+    # Select 4 timepoints evenly spaced
+    if T >= 4:
+        tick_indices = [0, T//3, 2*T//3, T-1]
+    else:
+        tick_indices = list(range(T)) + [T-1] * (4 - T)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    axes = axes.flatten()
+    
+    for i, t_idx in enumerate(tick_indices[:4]):
+        ax = axes[i]
+        # Average over batch and heads at this tick
+        attn_t = attn_history[t_idx].mean(axis=(0, 1))  # (n_genes, n_genes)
+        np.fill_diagonal(attn_t, 0)
+        
+        vmax = np.abs(attn_t).max()
+        vmin = max(np.abs(attn_t[attn_t != 0]).min(), 1e-6) if (attn_t != 0).any() else 1e-6
+        norm = SymLogNorm(linthresh=vmin, linscale=1, vmin=0, vmax=vmax)
+        
+        im = ax.imshow(np.abs(attn_t), cmap='viridis', norm=norm, aspect='auto')
+        plt.colorbar(im, ax=ax, label='|Attention|')
+        
+        # Compute sparsity (what % of weights are above mean?)
+        mean_val = np.abs(attn_t).mean()
+        above_mean = (np.abs(attn_t) > mean_val).sum() / attn_t.size * 100
+        ax.set_title(f'Tick {t_idx + 1}/{T}\n{above_mean:.1f}% above mean')
+        ax.set_xlabel('Target Gene')
+        ax.set_ylabel('Source Gene')
+    
+    plt.suptitle('Attention Evolution Over Ticks', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'attention_temporal.png'), dpi=150)
+    plt.close()
+    print(f"Saved temporal attention to {output_dir}/attention_temporal.png")
+
+
+def visualize_grn_comparison(attn_matrix, sync_matrix, combined_matrix, output_dir):
+    """
+    Side-by-side comparison of attention, sync, and combined GRN matrices.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    matrices = [
+        (attn_matrix, 'Attention (Direction)', 'plasma'),
+        (sync_matrix, 'Synchronization (Magnitude)', 'viridis'),
+        (combined_matrix, 'Combined (Attn × Sync)', 'inferno')
+    ]
+    
+    for ax, (matrix, title, cmap) in zip(axes, matrices):
+        if matrix is None:
+            ax.text(0.5, 0.5, 'Not available', ha='center', va='center', 
+                    transform=ax.transAxes, fontsize=12)
+            ax.set_title(title)
+            continue
+            
+        matrix = np.abs(matrix)
+        np.fill_diagonal(matrix, 0)
+        
+        vmax = matrix.max()
+        vmin = max(matrix[matrix != 0].min(), 1e-6) if (matrix != 0).any() else 1e-6
+        norm = SymLogNorm(linthresh=vmin, linscale=1, vmin=0, vmax=vmax)
+        
+        im = ax.imshow(matrix, cmap=cmap, norm=norm, aspect='auto')
+        plt.colorbar(im, ax=ax, label='|Weight| (log)')
+        ax.set_title(title)
+        ax.set_xlabel('Target Gene')
+        ax.set_ylabel('Source Gene')
+    
+    plt.suptitle('GRN Method Comparison', fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'grn_comparison.png'), dpi=150)
+    plt.close()
+    print(f"Saved GRN comparison to {output_dir}/grn_comparison.png")
+
+
+def visualize_top_edges_network(edges, grn_matrix, gene_names, output_dir, top_n=50):
+    """
+    Create directed network graph of top regulatory edges.
+    """
+    # Create directed graph
+    G = nx.DiGraph()
+    
+    # Add nodes (genes that appear in top edges)
+    genes_in_edges = set()
+    for src, tgt in edges[:top_n]:
+        genes_in_edges.add(src)
+        genes_in_edges.add(tgt)
+    
+    G.add_nodes_from(genes_in_edges)
+    
+    # Add edges with weights
+    gene_to_idx = {g: i for i, g in enumerate(gene_names)}
+    for src, tgt in edges[:top_n]:
+        if src in gene_to_idx and tgt in gene_to_idx:
+            weight = abs(grn_matrix[gene_to_idx[src], gene_to_idx[tgt]])
+            G.add_edge(src, tgt, weight=weight)
+    
+    if len(G.nodes()) == 0:
+        print("Warning: No nodes to visualize in network graph")
+        return
+    
+    # Compute node sizes based on degree
+    degrees = dict(G.degree())
+    node_sizes = [300 + degrees.get(n, 0) * 100 for n in G.nodes()]
+    
+    # Edge widths based on weight
+    weights = [G[u][v].get('weight', 0.01) for u, v in G.edges()]
+    max_w = max(weights) if weights else 1
+    edge_widths = [1 + 3 * w / max_w for w in weights]
+    
+    # Layout
+    plt.figure(figsize=(14, 10))
+    try:
+        pos = nx.spring_layout(G, k=2, iterations=50, seed=42)
+    except:
+        pos = nx.circular_layout(G)
+    
+    # Draw
+    nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color='lightblue', 
+                           edgecolors='black', linewidths=1)
+    nx.draw_networkx_edges(G, pos, width=edge_widths, alpha=0.6, 
+                           edge_color='gray', arrows=True, arrowsize=15,
+                           connectionstyle='arc3,rad=0.1')
+    nx.draw_networkx_labels(G, pos, font_size=8, font_weight='bold')
+    
+    # Find hub genes
+    in_degrees = dict(G.in_degree())
+    out_degrees = dict(G.out_degree())
+    
+    hub_regulators = sorted(out_degrees.items(), key=lambda x: x[1], reverse=True)[:5]
+    hub_targets = sorted(in_degrees.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    title = f'Top {min(top_n, len(edges))} Regulatory Edges\n'
+    title += f'Top Regulators: {", ".join([f"{g}({d})" for g,d in hub_regulators[:3]])}\n'
+    title += f'Top Targets: {", ".join([f"{g}({d})" for g,d in hub_targets[:3]])}'
+    
+    plt.title(title, fontsize=12)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'top_edges_network.png'), dpi=150, 
+                bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"Saved network graph to {output_dir}/top_edges_network.png")
 
 # CausalBench imports
 try:
@@ -317,10 +577,23 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
     For sync-based model: extracts from synchronization matrix (symmetric)
     For attention-based model: extracts from attention weights (DIRECTIONAL)
     For combined model: attention_direction × sync_magnitude (DIRECTIONAL + strong)
+    
+    Returns:
+        edges: List of (source, target) gene name tuples
+        grn_matrix: The final GRN matrix used for edge extraction
+        viz_data: Dict with all matrices needed for visualization
     """
     model.eval()
     gene_names = dataset.gene_names
     n_genes = len(gene_names)
+    
+    viz_data = {
+        'attention_history': None,
+        'attention_matrix': None,
+        'sync_matrix': None,
+        'combined_matrix': None,
+        'gene_names': gene_names,
+    }
     
     with torch.no_grad():
         x = dataset.control_expr.unsqueeze(0).to(device)
@@ -333,12 +606,17 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
             attn_history = result['attention']  # (T, B, n_heads, n_genes, n_genes)
             synch_history = result['synch']     # (T, B, synch_dim)
             
+            # Store for visualization
+            viz_data['attention_history'] = attn_history
+            
             # Get attention matrix (direction): average over time, batch, heads
             attn_matrix = attn_history.mean(axis=(0, 1, 2))  # (n_genes, n_genes)
+            viz_data['attention_matrix'] = attn_matrix
             
             # Get sync matrix (magnitude): use final timestep
             synch_vec = synch_history[-1, 0]  # Final time, first batch
             synch_matrix = reconstruct_synch_matrix(synch_vec, n_genes)
+            viz_data['sync_matrix'] = synch_matrix
             
             # COMBINE: attention provides direction, sync provides magnitude
             # Attention is already normalized (softmax), sync has raw magnitude
@@ -350,6 +628,7 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
             # Combined GRN: attention_weight * sync_magnitude
             # This is DIRECTIONAL (from attention) with MAGNITUDE (from sync)
             combined_grn = attn_matrix * sync_magnitude
+            viz_data['combined_matrix'] = combined_grn.copy()
             
             # Zero diagonal
             np.fill_diagonal(combined_grn, 0)
@@ -378,14 +657,18 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
             
             print(f"Extracted {len(edges)} COMBINED edges (attention×sync)")
             print(f"  Attention provides DIRECTION, Sync provides MAGNITUDE")
-            return edges, combined_grn
+            return edges, combined_grn, viz_data
         
         elif model.use_attention:
             # Attention-only: result is dict with 'attention' key
             attn_history = result['attention']  # (T, B, n_heads, n_genes, n_genes)
             
+            # Store for visualization
+            viz_data['attention_history'] = attn_history
+            
             # Average over time, batch, and heads to get (n_genes, n_genes) matrix
             grn_matrix = attn_history.mean(axis=(0, 1, 2))
+            viz_data['attention_matrix'] = grn_matrix.copy()
             
             # Attention is DIRECTIONAL: A[i,j] = "gene i regulates gene j"
             np.fill_diagonal(grn_matrix, 0)
@@ -412,7 +695,7 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
                     seen_edges.add(edge_key)
             
             print(f"Extracted {len(edges)} DIRECTIONAL edges from attention")
-            return edges, grn_matrix
+            return edges, grn_matrix, viz_data
         
         else:
             # Sync-based: result is dict with 'synch' key
@@ -424,6 +707,7 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
                 synch_vec = synch_vec.cpu().numpy()
             
             synch_matrix = reconstruct_synch_matrix(synch_vec, n_genes)
+            viz_data['sync_matrix'] = synch_matrix.copy()
             
             # Sync matrix is symmetric - only need upper triangle
             np.fill_diagonal(synch_matrix, 0)
@@ -441,7 +725,7 @@ def extract_edges_from_model(model, dataset, device='cpu', top_k=1000):
                 gene_b = gene_names[triu_idx[1][idx]]
                 edges.append((gene_a, gene_b))
             
-            return edges, synch_matrix
+            return edges, synch_matrix, viz_data
 
 
 def run_causalbench_evaluation(args):
@@ -566,12 +850,12 @@ def run_causalbench_evaluation(args):
         print("\nExtracting edges from attention weights (DIRECTIONAL)...")
     else:
         print("\nExtracting edges from synchronization matrix...")
-    edges, grn_matrix = extract_edges_from_model(
+    edges, grn_matrix, viz_data = extract_edges_from_model(
         model, train_dataset, args.device, args.top_k_edges
     )
     print(f"Extracted {len(edges)} edges")
     
-    # Plot GRN matrix
+    # Plot GRN matrix (basic)
     plt.figure(figsize=(10, 8))
     plt.imshow(np.abs(grn_matrix), cmap='viridis', aspect='auto')
     if args.use_combined:
@@ -585,6 +869,38 @@ def run_causalbench_evaluation(args):
         plt.title('Inferred GRN (Synchronization Matrix)')
     plt.savefig(os.path.join(args.output_dir, 'grn_matrix.png'), dpi=150)
     plt.close()
+    
+    # ==========================================================================
+    # ENHANCED VISUALIZATIONS
+    # ==========================================================================
+    print("\nGenerating enhanced visualizations...")
+    
+    # 1. Enhanced heatmap (log-scale, sparsified, clustered)
+    visualize_enhanced_heatmap(grn_matrix, args.output_dir)
+    
+    # 2. Per-head attention visualization (if using attention)
+    if viz_data['attention_history'] is not None:
+        visualize_per_head_attention(
+            viz_data['attention_history'], 
+            args.output_dir,
+            n_heads=args.n_attention_heads
+        )
+        
+        # 3. Temporal evolution of attention
+        visualize_temporal_attention(viz_data['attention_history'], args.output_dir)
+    
+    # 4. Method comparison (if we have multiple matrices)
+    visualize_grn_comparison(
+        viz_data.get('attention_matrix'),
+        viz_data.get('sync_matrix'),
+        viz_data.get('combined_matrix'),
+        args.output_dir
+    )
+    
+    # 5. Network graph of top edges
+    visualize_top_edges_network(
+        edges, grn_matrix, gene_names, args.output_dir, top_n=50
+    )
     
     # Evaluate with CausalBench
     print("\nEvaluating with CausalBench...")
