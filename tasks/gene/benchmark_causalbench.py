@@ -570,13 +570,8 @@ def train_perturbation_model(model, dataset, device='cpu', training_iterations=2
         loss.backward()
         
         # Aggressive gradient clipping to prevent explosion
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-        
-        # Skip update if loss is exploding (NaN protection)
-        if loss.item() > 100:
-            print(f"Skipping step {step} - loss too high: {loss.item():.2f}")
-            optimizer.zero_grad()
-            continue
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+        wandb.log({"loss": loss.item(), "grad_norm": grad_norm.item(), "step": step})
         
         optimizer.step()
         scheduler.step()
